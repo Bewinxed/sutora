@@ -1,12 +1,13 @@
-// src/lib/server/routes/instances/index.ts
+// src/routes/api/[...slugs]/instances/index.ts
 import { Elysia, t } from 'elysia';
-import { $} from 'bun';
+import { $ } from 'bun';
 import { db } from '$lib/server/db';
 import { comfyInstances, envVars } from '$lib/server/db/schema';
 import { eq } from 'drizzle-orm';
 import { launchComfyUI, stopComfyInstance, type ComfyUIOptions } from '$lib/utils/comfyuiCli';
 import type { ElysiaApp } from '../+server';
 import { findAvailablePort } from '$lib/utils/portUtils';
+import { isLinux, isMacOS, isWindows } from '$lib/utils/platformUtils';
 
 export default (app: ElysiaApp) =>
 	app
@@ -35,14 +36,25 @@ export default (app: ElysiaApp) =>
 					// Parse options into JSON string
 					const optionsString = JSON.stringify(body.options || {});
 
+					// Handle platform-specific GPU indices format
+					let gpuIndices: string;
+
+					if (Array.isArray(body.gpuIndices)) {
+						gpuIndices = body.gpuIndices.join(',');
+					} else if (typeof body.gpuIndices === 'string') {
+						// macOS might use 'mps' or 'cpu' as a string
+						gpuIndices = body.gpuIndices;
+					} else {
+						// Default to CPU if nothing is specified
+						gpuIndices = 'cpu';
+					}
+
 					const result = await db
 						.insert(comfyInstances)
 						.values({
 							name: body.name,
 							port: body.port,
-							gpuIndices: Array.isArray(body.gpuIndices)
-								? body.gpuIndices.join(',')
-								: body.gpuIndices,
+							gpuIndices: gpuIndices,
 							options: optionsString
 						})
 						.returning();
@@ -101,9 +113,22 @@ export default (app: ElysiaApp) =>
 				// Parse options from JSON string
 				const options: ComfyUIOptions = JSON.parse(instance.options);
 
-				// Merge in required options
+				// Set platform-specific options
 				options.port = instance.port;
-				options.cudaDevice = parseInt(instance.gpuIndices.split(',')[0]);
+
+				// Handle different GPU formats based on platform
+				if (isLinux || isWindows) {
+					// For Linux/Windows, use CUDA device if available
+					const gpuIndices = instance.gpuIndices.split(',');
+					if (gpuIndices.length > 0 && gpuIndices[0] !== 'cpu') {
+						options.cudaDevice = parseInt(gpuIndices[0]);
+					}
+				} else if (isMacOS) {
+					// For macOS, check if using Metal (MPS)
+					if (instance.gpuIndices === 'mps') {
+						options.useMps = true;
+					}
+				}
 
 				// Launch ComfyUI
 				const comfyInstance = await launchComfyUI(
@@ -187,9 +212,15 @@ export default (app: ElysiaApp) =>
 					});
 				}
 
-				// Kill the process
+				// Platform-specific process termination
 				try {
-					process.kill(instance.pid, 'SIGTERM');
+					if (isLinux || isMacOS) {
+						// On Unix-like systems, we can kill directly
+						process.kill(instance.pid, 'SIGTERM');
+					} else if (isWindows) {
+						// On Windows, use taskkill
+						await $`taskkill /PID ${instance.pid} /T /F`.quiet();
+					}
 				} catch (killError) {
 					console.error(`Error killing process ${instance.pid}:`, killError);
 				}
@@ -241,9 +272,17 @@ export default (app: ElysiaApp) =>
 					};
 				}
 
-				// Check if process is actually running using Bun Shell
-				const checkResult = await $`ps -p ${instance.pid}`.nothrow().quiet();
-				const isRunning = checkResult.exitCode === 0;
+				// Platform-specific process check
+				let isRunning = false;
+				if (isLinux || isMacOS) {
+					// On Unix-like systems, we can use ps
+					const checkResult = await $`ps -p ${instance.pid}`.nothrow().quiet();
+					isRunning = checkResult.exitCode === 0;
+				} else if (isWindows) {
+					// On Windows, use tasklist
+					const checkResult = await $`tasklist /FI "PID eq ${instance.pid}" /NH`.nothrow().quiet();
+					isRunning = (await checkResult.text()).includes(instance.pid.toString());
+				}
 
 				// Check if the API is responding
 				const port = instance.port;
@@ -295,4 +334,86 @@ export default (app: ElysiaApp) =>
 			const basePort = Number(query.basePort) || 8188;
 			const port = await findAvailablePort(basePort);
 			return { port };
+		})
+		// Get available GPU options based on the platform
+		.get('/gpu-options', async () => {
+			try {
+				// Get ComfyUI path from environment variables
+				const pathResult = await db.select().from(envVars).where(eq(envVars.key, 'COMFYUI_PATH'));
+				if (pathResult.length === 0) {
+					return new Response(
+						JSON.stringify({
+							error: 'ComfyUI path not set. Please set COMFYUI_PATH environment variable.'
+						}),
+						{
+							status: 400,
+							headers: { 'Content-Type': 'application/json' }
+						}
+					);
+				}
+
+				const comfyuiPath = pathResult[0].value;
+
+				// Create a temporary script to detect GPUs using PyTorch
+				const scriptPath = '/tmp/detect_gpus.py';
+				await Bun.write(
+					scriptPath,
+					`
+import torch
+import json
+import sys
+
+def get_gpu_options():
+    results = {
+        "platform": sys.platform,
+        "options": []
+    }
+    
+    # Check for CUDA (NVIDIA) GPUs
+    if torch.cuda.is_available():
+        cuda_count = torch.cuda.device_count()
+        for i in range(cuda_count):
+            results["options"].append({
+                "type": "cuda",
+                "index": i,
+                "name": torch.cuda.get_device_name(i)
+            })
+    
+    # Check for Apple Metal (MPS)
+    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        results["options"].append({
+            "type": "mps",
+            "index": "mps",
+            "name": "Apple Metal GPU"
+        })
+    
+    # Always include CPU as an option
+    results["options"].append({
+        "type": "cpu",
+        "index": "cpu",
+        "name": "CPU"
+    })
+    
+    return results
+
+print(json.dumps(get_gpu_options()))
+`
+				);
+
+				// Get Python path and run the script
+				const pythonPath = await $`which python3 || which python`.text().then((t) => t.trim());
+				const result = await $`${pythonPath} ${scriptPath}`.text();
+
+				// Clean up
+				await $`rm ${scriptPath}`.quiet();
+
+				// Parse and return the results
+				return JSON.parse(result.trim());
+			} catch (error) {
+				console.error('Error getting GPU options:', error);
+				return new Response(JSON.stringify({ error: String(error) }), {
+					status: 500,
+					headers: { 'Content-Type': 'application/json' }
+				});
+			}
 		});

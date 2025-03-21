@@ -1,6 +1,7 @@
 // src/lib/utils/comfyuiCli.ts
 import { $, type ShellPromise } from 'bun';
 import { getPythonPath } from './pythonUtils';
+import { getPlatformEnv, isLinux, isMacOS, isWindows } from './platformUtils';
 
 // Define the interface for ComfyUI CLI options
 export interface ComfyUIOptions {
@@ -28,6 +29,9 @@ export interface ComfyUIOptions {
 	cudaDevice?: number;
 	cudaMalloc?: boolean;
 	disableCudaMalloc?: boolean;
+
+	// macOS specific options
+	useMps?: boolean; // Use Metal Performance Shaders on Apple Silicon
 
 	// Precision options
 	forceFp32?: boolean;
@@ -128,6 +132,9 @@ export function buildArgs(options: ComfyUIOptions): string[] {
 	const args: string[] = [];
 
 	for (const [key, value] of Object.entries(options)) {
+		// Skip internal options that don't map to CLI arguments
+		if (key === 'cudaDevice' || key === 'useMps') continue;
+
 		if (value === undefined || value === false) continue;
 
 		const kebabKey = toKebabCase(key);
@@ -162,7 +169,6 @@ export function buildArgs(options: ComfyUIOptions): string[] {
 }
 
 // Launch a ComfyUI instance
-// Launch a ComfyUI instance
 export async function launchComfyUI(
 	comfyuiPath: string,
 	options: ComfyUIOptions,
@@ -171,12 +177,8 @@ export async function launchComfyUI(
 ): Promise<ComfyInstance> {
 	const args = buildArgs(options);
 
-	// Set environment variables for GPU selection
-	const env = {
-		...process.env,
-		CUDA_VISIBLE_DEVICES:
-			options.cudaDevice !== undefined ? options.cudaDevice.toString() : undefined
-	};
+	// Set platform-specific environment variables
+	const env = getPlatformEnv(options);
 
 	try {
 		// Get the appropriate Python path
@@ -186,7 +188,7 @@ export async function launchComfyUI(
 		console.log(`Starting ComfyUI in ${comfyuiPath} with Python: ${pythonPath}`);
 
 		const shellProcess = $`cd ${comfyuiPath} && ${pythonPath} main.py ${args.join(' ')}`
-			.env(env as Record<string, string>)
+			.env(env)
 			.nothrow();
 
 		// Set up stdout and stderr handling
@@ -204,10 +206,20 @@ export async function launchComfyUI(
 			});
 		}
 
+		// Determine GPU indices based on platform
+		let gpuIndices = '';
+		if (options.cudaDevice !== undefined) {
+			gpuIndices = options.cudaDevice.toString();
+		} else if (isMacOS && options.useMps) {
+			gpuIndices = 'mps';
+		} else {
+			gpuIndices = 'cpu';
+		}
+
 		const instance: ComfyInstance = {
 			process: shellProcess,
 			port: options.port || 8188,
-			gpuIndices: options.cudaDevice !== undefined ? options.cudaDevice.toString() : '',
+			gpuIndices,
 			options,
 			status: 'running'
 		};
@@ -228,7 +240,7 @@ export async function stopComfyInstance(instance: ComfyInstance): Promise<boolea
 	try {
 		// For cross-platform compatibility, we need to terminate the process
 		// ShellPromise doesn't have a direct kill method, but in Bun we can use
-		// the underlying Node compatible process API
+		// the finally method to cancel the command
 
 		// First, cancel any running command using .finally()
 		instance.process.finally();
