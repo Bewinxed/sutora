@@ -63,16 +63,18 @@ export async function recordMetrics() {
 
 /**
  * Start monitoring at specified interval (in ms)
+ * @returns The interval ID for cleanup
  */
-export function startMonitoring(interval: number = 5000) {
+export function startMonitoring(interval: number = 5000): Timer {
 	console.log(`Starting resource monitoring at ${interval}ms intervals`);
 	return setInterval(recordMetrics, interval);
 }
 
 /**
  * Stop monitoring
+ * @param intervalId The interval ID to clear
  */
-export function stopMonitoring(intervalId: NodeJS.Timeout) {
+export function stopMonitoring(intervalId: Timer): void {
 	clearInterval(intervalId);
 	console.log('Resource monitoring stopped');
 }

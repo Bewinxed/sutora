@@ -7,6 +7,9 @@ import { db } from '$lib/server/db';
 import { envVars } from '$lib/server/db/schema';
 import { eq } from 'drizzle-orm';
 
+// Cache for Python paths
+const pythonPathCache = new Map<string, string>();
+
 /**
  * Find Python executable in a virtual environment
  * @param baseDir The base directory where ComfyUI is installed
@@ -34,16 +37,20 @@ export async function findPythonInVenv(baseDir: string): Promise<string | null> 
 		}
 
 		// If not found in standard venv locations, check for a conda environment
-		const condaGlob = new Glob(`**/python{,.exe}`);
-		for await (const match of condaGlob.scan({
-			cwd: join(baseDir, 'conda_env'),
-			onlyFiles: true,
-			absolute: true,
-			followSymlinks: true,
-			dot: true
-		})) {
-			if (existsSync(match)) {
-				return match;
+		// Only check if conda_env directory exists to avoid errors
+		const condaEnvPath = join(baseDir, 'conda_env');
+		if (existsSync(condaEnvPath)) {
+			const condaGlob = new Glob(`**/python{,.exe}`);
+			for await (const match of condaGlob.scan({
+				cwd: condaEnvPath,
+				onlyFiles: true,
+				absolute: true,
+				followSymlinks: true,
+				dot: true
+			})) {
+				if (existsSync(match)) {
+					return match;
+				}
 			}
 		}
 
@@ -111,6 +118,11 @@ export async function validatePython(pythonPath: string): Promise<{
  * @returns Path to Python executable
  */
 export async function getPythonPath(comfyuiPath: string): Promise<string> {
+	// Check cache first
+	if (pythonPathCache.has(comfyuiPath)) {
+		return pythonPathCache.get(comfyuiPath)!;
+	}
+
 	// First, check if we have a custom Python path in the database
 	const pythonPathResult = await db.select().from(envVars).where(eq(envVars.key, 'PYTHON_PATH'));
 
@@ -122,6 +134,7 @@ export async function getPythonPath(comfyuiPath: string): Promise<string> {
 		const validation = await validatePython(pythonPath);
 		if (validation.valid) {
 			console.log(`Using configured Python path: ${pythonPath} (${validation.version})`);
+			pythonPathCache.set(comfyuiPath, pythonPath);
 			return pythonPath;
 		}
 
@@ -153,6 +166,7 @@ export async function getPythonPath(comfyuiPath: string): Promise<string> {
 					}
 				});
 
+			pythonPathCache.set(comfyuiPath, venvPython);
 			return venvPython;
 		}
 	}
@@ -162,5 +176,14 @@ export async function getPythonPath(comfyuiPath: string): Promise<string> {
 	console.warn(
 		`No valid Python virtual environment detected. Using system Python: ${systemPython}`
 	);
+
+	pythonPathCache.set(comfyuiPath, systemPython);
 	return systemPython;
+}
+
+/**
+ * Clear the Python path cache
+ */
+export function clearPythonPathCache(): void {
+	pythonPathCache.clear();
 }
